@@ -1,15 +1,19 @@
 package net.teppan.shazo;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 
 /**
  * An immutable tabular result returned by a storage operation.
  *
- * <p>Each row is a column-name-to-raw-value mapping. Column names are
- * case-sensitive and match the names returned by the underlying storage
- * system (e.g., SQL column aliases in the {@code SELECT} list).
+ * <p>Each row is a column-name-to-raw-value mapping. Column-name lookups are
+ * <strong>case-insensitive</strong>, so an infuser can use {@code row.get("id")}
+ * regardless of whether the backend reports {@code ID}, {@code id}, or
+ * {@code Id} — this decouples describers from a backend's column-casing
+ * conventions (for example H2 upper-cases names by default).
  *
  * <h2>Example</h2>
  * <pre>{@code
@@ -31,9 +35,18 @@ import java.util.Optional;
  */
 public record RawResult(List<Map<String, Object>> rows) {
 
-    /** Compact constructor — defensively copies the row list. */
+    /**
+     * Compact constructor — copies each row into an immutable, case-insensitive
+     * map so column lookups do not depend on the backend's column casing.
+     */
     public RawResult {
-        rows = List.copyOf(rows);
+        rows = rows.stream().map(RawResult::caseInsensitive).toList();
+    }
+
+    private static Map<String, Object> caseInsensitive(Map<String, Object> row) {
+        var map = new TreeMap<String, Object>(String.CASE_INSENSITIVE_ORDER);
+        map.putAll(row);
+        return Collections.unmodifiableMap(map);
     }
 
     /**

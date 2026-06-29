@@ -9,6 +9,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
@@ -37,32 +38,46 @@ import java.util.concurrent.Executors;
  * delivered through the future's failure channel. Unwrap it with
  * {@code future.get()} or {@code exceptionally()}.
  *
+ * <h2>Lifecycle</h2>
+ * <p>When constructed without an executor, this class owns an internal
+ * virtual-thread executor and must be {@linkplain #close() closed} to release
+ * it — use it in a try-with-resources block. When an executor is supplied by
+ * the caller, the caller owns it and {@link #close()} leaves it untouched.
+ *
  * @param <T> the domain type managed by the underlying repository
  */
-public final class AsyncRepository<T> {
+public final class AsyncRepository<T> implements AutoCloseable {
 
     private final Repository<T> delegate;
     private final Executor executor;
+    private final boolean ownsExecutor;
 
     /**
-     * Constructs an {@code AsyncRepository} using a virtual-thread-per-task
-     * executor.
+     * Constructs an {@code AsyncRepository} using an internally-owned
+     * virtual-thread-per-task executor. The instance must be closed to release
+     * the executor.
      *
      * @param delegate the underlying repository; never {@code null}
      */
     public AsyncRepository(Repository<T> delegate) {
-        this(delegate, Executors.newVirtualThreadPerTaskExecutor());
+        this(delegate, Executors.newVirtualThreadPerTaskExecutor(), true);
     }
 
     /**
-     * Constructs an {@code AsyncRepository} with a custom executor.
+     * Constructs an {@code AsyncRepository} with a caller-supplied executor.
+     * The caller retains ownership; {@link #close()} does not shut it down.
      *
      * @param delegate the underlying repository; never {@code null}
      * @param executor the executor for async operations; never {@code null}
      */
     public AsyncRepository(Repository<T> delegate, Executor executor) {
+        this(delegate, executor, false);
+    }
+
+    private AsyncRepository(Repository<T> delegate, Executor executor, boolean ownsExecutor) {
         this.delegate = Objects.requireNonNull(delegate, "delegate");
         this.executor = Objects.requireNonNull(executor, "executor");
+        this.ownsExecutor = ownsExecutor;
     }
 
     /**
@@ -158,5 +173,17 @@ public final class AsyncRepository<T> {
      */
     public Repository<T> synchronous() {
         return delegate;
+    }
+
+    /**
+     * Shuts down the internally-owned executor, awaiting completion of
+     * in-flight tasks. Has no effect when the executor was supplied by the
+     * caller, and is idempotent.
+     */
+    @Override
+    public void close() {
+        if (ownsExecutor && executor instanceof ExecutorService service) {
+            service.close();
+        }
     }
 }

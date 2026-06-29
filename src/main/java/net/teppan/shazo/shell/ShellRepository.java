@@ -13,10 +13,12 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
@@ -30,9 +32,13 @@ import java.util.stream.Collectors;
  * column {@code "line"}.  Use {@link LineParser#tabDelimited(String...)} or
  * {@link LineParser#delimited(String, String...)} for structured output.
  *
- * <p>stdout and stderr are read concurrently using a virtual thread, eliminating
+ * <p>stdout and stderr are drained concurrently on virtual threads, eliminating
  * the deadlock risk that arises when a process fills its stdout buffer while the
  * caller is blocking on stderr (or vice versa).
+ *
+ * <p>Each process is bounded by a timeout (default {@link #DEFAULT_TIMEOUT}); a
+ * process still running when it elapses is forcibly terminated and the operation
+ * fails with {@link ShazoException}.
  *
  * <p>A non-zero exit code causes {@link #execute} to throw
  * {@link ShazoException} with the exit code and stderr content included in the
@@ -71,35 +77,39 @@ public final class ShellRepository<T> extends AbstractRepository<T, ShellCommand
 
     private static final Logger log = LoggerFactory.getLogger(ShellRepository.class);
 
+    /** Default per-process timeout when none is specified. */
+    public static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(60);
+
     private final LineParser lineParser;
     private final File       workingDirectory;
+    private final Duration   timeout;
 
     /**
      * Constructs a {@code ShellRepository} using the default
-     * {@link LineParser#byLine()} parser and the JVM's current working
-     * directory.
+     * {@link LineParser#byLine()} parser, the JVM's current working
+     * directory, and the {@link #DEFAULT_TIMEOUT}.
      *
      * @param describer the describer for domain type {@code T}; never {@code null}
      */
     public ShellRepository(Describer<T, ShellCommand> describer) {
-        this(describer, LineParser.byLine(), null);
+        this(describer, LineParser.byLine(), null, DEFAULT_TIMEOUT);
     }
 
     /**
-     * Constructs a {@code ShellRepository} with a custom line parser and
-     * the JVM's current working directory.
+     * Constructs a {@code ShellRepository} with a custom line parser, the JVM's
+     * current working directory, and the {@link #DEFAULT_TIMEOUT}.
      *
      * @param describer  the describer for domain type {@code T}; never {@code null}
      * @param lineParser the parser applied to each non-blank stdout line;
      *                   never {@code null}
      */
     public ShellRepository(Describer<T, ShellCommand> describer, LineParser lineParser) {
-        this(describer, lineParser, null);
+        this(describer, lineParser, null, DEFAULT_TIMEOUT);
     }
 
     /**
      * Constructs a {@code ShellRepository} with a custom line parser and
-     * working directory.
+     * working directory, using the {@link #DEFAULT_TIMEOUT}.
      *
      * @param describer        the describer for domain type {@code T}; never {@code null}
      * @param lineParser       the parser for stdout lines; never {@code null}
@@ -108,9 +118,30 @@ public final class ShellRepository<T> extends AbstractRepository<T, ShellCommand
      */
     public ShellRepository(Describer<T, ShellCommand> describer, LineParser lineParser,
                            File workingDirectory) {
+        this(describer, lineParser, workingDirectory, DEFAULT_TIMEOUT);
+    }
+
+    /**
+     * Constructs a {@code ShellRepository} with full control over the line
+     * parser, working directory, and per-process timeout.
+     *
+     * @param describer        the describer for domain type {@code T}; never {@code null}
+     * @param lineParser       the parser for stdout lines; never {@code null}
+     * @param workingDirectory the working directory for launched processes;
+     *                         {@code null} inherits the JVM's working directory
+     * @param timeout          the maximum time to wait for each process; a
+     *                         process still running when it elapses is killed and
+     *                         the operation fails; must be positive
+     */
+    public ShellRepository(Describer<T, ShellCommand> describer, LineParser lineParser,
+                           File workingDirectory, Duration timeout) {
         super(describer);
         this.lineParser       = Objects.requireNonNull(lineParser, "lineParser");
         this.workingDirectory = workingDirectory; // nullable
+        this.timeout          = Objects.requireNonNull(timeout, "timeout");
+        if (timeout.isZero() || timeout.isNegative()) {
+            throw new IllegalArgumentException("timeout must be positive: " + timeout);
+        }
     }
 
     /**
@@ -150,45 +181,60 @@ public final class ShellRepository<T> extends AbstractRepository<T, ShellCommand
             throw new ShazoException("Failed to start process: " + args, e);
         }
 
-        // stdout is read on a dedicated virtual thread so that the current
-        // thread can drain stderr concurrently — without this, a process that
-        // fills its stdout OS buffer while we block on stderr will deadlock.
-        // A bare virtual thread (rather than an Executor) avoids leaking an
-        // executor per invocation.
+        // Both streams are drained on dedicated virtual threads. This avoids the
+        // classic deadlock (a process filling one pipe buffer while we block on
+        // the other) AND lets the current thread enforce the timeout with
+        // waitFor(): if we read either stream inline, a process that never
+        // closes it would block us before we could time out. Bare virtual
+        // threads (not an Executor) mean nothing to leak per invocation.
         var stdoutHolder = new AtomicReference<List<String>>(List.of());
+        var stderrHolder = new AtomicReference<String>("");
         var stdoutError  = new AtomicReference<IOException>();
+        var stderrError  = new AtomicReference<IOException>();
+
         var stdoutThread = Thread.ofVirtual().name("shazo-shell-stdout").start(() -> {
-            try (var reader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream(),
-                                         StandardCharsets.UTF_8))) {
+            try (var reader = new BufferedReader(new InputStreamReader(
+                    process.getInputStream(), StandardCharsets.UTF_8))) {
                 stdoutHolder.set(reader.lines().toList());
             } catch (IOException e) {
                 stdoutError.set(e);
             }
         });
-
-        String stderr;
-        try (var reader = new BufferedReader(
-                new InputStreamReader(process.getErrorStream(),
-                                      StandardCharsets.UTF_8))) {
-            stderr = reader.lines().collect(Collectors.joining("\n"));
-        } catch (IOException e) {
-            throw new ShazoException("Failed to read stderr from: " + args, e);
-        }
+        var stderrThread = Thread.ofVirtual().name("shazo-shell-stderr").start(() -> {
+            try (var reader = new BufferedReader(new InputStreamReader(
+                    process.getErrorStream(), StandardCharsets.UTF_8))) {
+                stderrHolder.set(reader.lines().collect(Collectors.joining("\n")));
+            } catch (IOException e) {
+                stderrError.set(e);
+            }
+        });
 
         int exitCode;
         try {
-            exitCode = process.waitFor();
+            if (!process.waitFor(timeout.toNanos(), TimeUnit.NANOSECONDS)) {
+                process.destroyForcibly();
+                stdoutThread.join();
+                stderrThread.join();
+                throw new ShazoException(
+                    "Process timed out after " + timeout + ": " + args);
+            }
+            exitCode = process.exitValue();
             stdoutThread.join();
+            stderrThread.join();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             process.destroyForcibly();
             throw new ShazoException("Process interrupted: " + args, e);
         }
+
         if (stdoutError.get() != null) {
             throw new ShazoException("Failed to read stdout from: " + args, stdoutError.get());
         }
+        if (stderrError.get() != null) {
+            throw new ShazoException("Failed to read stderr from: " + args, stderrError.get());
+        }
         List<String> stdoutLines = stdoutHolder.get();
+        String       stderr      = stderrHolder.get();
 
         if (exitCode != 0) {
             var msg = "Process exited with code " + exitCode + ": " + args;

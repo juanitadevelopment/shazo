@@ -6,6 +6,7 @@ import net.teppan.shazo.ShazoException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -166,6 +167,39 @@ class ShellRepositoryTest {
         assertThatThrownBy(() -> failingRepo.retrieve(new Line("x")))
             .isInstanceOf(ShazoException.class)
             .hasMessageContaining("42");
+    }
+
+    @Test
+    void slowProcessTimesOut() {
+        Describer<Line, ShellCommand> describer = Describer.<Line, ShellCommand>builder()
+            .contains(l -> List.of())
+            .store   (l -> List.of())
+            .delete  (l -> List.of())
+            .retrieve(l -> List.of(ShellCommand.of("sh", "-c", "sleep 10")))
+            .catalog (l -> List.of())
+            .infuser (result -> new Line(""))
+            .cataloger(result -> List.of())
+            .build();
+
+        var repo = new ShellRepository<>(describer,
+            LineParser.byLine(), null, Duration.ofMillis(200));
+
+        assertThatThrownBy(() -> repo.retrieve(new Line("x")))
+            .isInstanceOf(ShazoException.class)
+            .hasMessageContaining("timed out");
+    }
+
+    @Test
+    void rejectsNonPositiveTimeout() {
+        Describer<Line, ShellCommand> describer = Describer.<Line, ShellCommand>builder()
+            .contains(l -> List.of()).store(l -> List.of()).delete(l -> List.of())
+            .retrieve(l -> List.of()).catalog(l -> List.of())
+            .infuser(result -> new Line("")).cataloger(result -> List.of())
+            .build();
+
+        assertThatThrownBy(() -> new ShellRepository<>(describer,
+                LineParser.byLine(), null, Duration.ZERO))
+            .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test

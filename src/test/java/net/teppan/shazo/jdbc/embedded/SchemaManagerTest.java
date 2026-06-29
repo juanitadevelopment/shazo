@@ -136,6 +136,36 @@ class SchemaManagerTest {
     }
 
     @Test
+    void detectsDriftWhenAppliedScriptChanges() throws ShazoException, SQLException {
+        SchemaManager.apply(dataSource, SCHEMA_LOCATION);
+
+        // Simulate the on-disk script changing after it was applied by corrupting
+        // its recorded checksum; the next apply must refuse rather than ignore it.
+        try (var conn = dataSource.getConnection();
+             var stmt = conn.createStatement()) {
+            stmt.executeUpdate(
+                "UPDATE _shazo_schema_migrations SET checksum = 'deadbeef' WHERE version = 1");
+        }
+
+        assertThatThrownBy(() -> SchemaManager.apply(dataSource, SCHEMA_LOCATION))
+            .isInstanceOf(ShazoException.class)
+            .hasMessageContaining("checksum");
+    }
+
+    @Test
+    void splitsStatementsWithSemicolonsInsideStringLiterals()
+            throws ShazoException, SQLException {
+        SchemaManager.apply(dataSource, "net/teppan/shazo/jdbc/embedded/tricky/");
+
+        try (var conn = dataSource.getConnection();
+             var stmt = conn.createStatement();
+             var rs   = stmt.executeQuery("SELECT note FROM tricky WHERE id = 'a'")) {
+            assertThat(rs.next()).isTrue();
+            assertThat(rs.getString("note")).isEqualTo("has; a semicolon -- and dashes");
+        }
+    }
+
+    @Test
     void applyDoesNotThrowForMissingLocation() {
         // Missing classpath location → no scripts found → returns silently
         org.assertj.core.api.Assertions.assertThatCode(() ->
