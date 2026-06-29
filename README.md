@@ -9,7 +9,7 @@ storage (a `Describer` that emits typed commands), so the same domain code can b
 backed by a relational database in production and a directory of files in a test,
 without changing a line of business logic.
 
-> **Status:** early release (`0.1.0`). The core API is stable and fully tested,
+> **Status:** early release (`0.1.1`). The core API is stable and fully tested,
 > but minor breaking changes are still possible before `1.0.0`.
 
 ## Requirements
