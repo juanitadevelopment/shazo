@@ -52,10 +52,15 @@ public interface UnitOfWork {
     <T> Repository<T> repository(Describer<T, SqlCommand> describer);
 
     /**
-     * Returns the JDBC connection backing this unit of work.
+     * Returns the JDBC connection backing this unit of work, for statements that
+     * do not fit the repository model.
      *
-     * <p>The connection participates in the surrounding transaction; callers
-     * must not commit, roll back, or close it.
+     * <p>The connection participates in the surrounding transaction, whose
+     * boundary the unit of work owns. The returned connection is a guarded view:
+     * {@code commit()}, {@code rollback()}, {@code close()},
+     * {@code setAutoCommit(boolean)}, and {@code abort(Executor)} throw
+     * {@link UnsupportedOperationException}. Every other operation is forwarded to
+     * the real connection.
      *
      * @return the transaction's connection; never {@code null}
      */

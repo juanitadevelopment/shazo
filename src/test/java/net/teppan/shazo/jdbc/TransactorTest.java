@@ -112,6 +112,48 @@ class TransactorTest {
     }
 
     @Test
+    void guardedConnectionForbidsTransactionBoundaryOperations() throws ShazoException {
+        transactor.execute(uow -> {
+            var conn = uow.connection();
+            assertThatThrownBy(conn::commit).isInstanceOf(UnsupportedOperationException.class);
+            assertThatThrownBy(conn::rollback).isInstanceOf(UnsupportedOperationException.class);
+            assertThatThrownBy(conn::close).isInstanceOf(UnsupportedOperationException.class);
+            assertThatThrownBy(() -> conn.setAutoCommit(true))
+                .isInstanceOf(UnsupportedOperationException.class);
+            assertThatThrownBy(() -> conn.abort(Runnable::run))
+                .isInstanceOf(UnsupportedOperationException.class);
+            return null;
+        });
+    }
+
+    @Test
+    void guardedConnectionStillAllowsOrdinaryOperations() throws ShazoException {
+        transactor.execute(uow -> {
+            var conn = uow.connection();
+            try {
+                // A representative non-boundary call is forwarded to the real connection.
+                assertThat(conn.getAutoCommit()).isFalse();      // Transactor disabled it
+                assertThat(conn.getMetaData()).isNotNull();
+                assertThat(conn.isClosed()).isFalse();
+            } catch (Exception e) {
+                throw new ShazoException("forwarded call failed", e);
+            }
+            return null;
+        });
+    }
+
+    @Test
+    void guardedConnectionUnwrapsUnderlyingSqlException() throws ShazoException {
+        // A forwarded call that fails must surface the real SQLException, not the
+        // proxy's InvocationTargetException / UndeclaredThrowableException.
+        transactor.execute(uow -> {
+            assertThatThrownBy(() -> uow.connection().prepareStatement("SELECT * FROM no_such_table").execute())
+                .isInstanceOf(java.sql.SQLException.class);
+            return null;
+        });
+    }
+
+    @Test
     void exposesRawConnectionParticipatingInTheTransaction() throws ShazoException {
         transactor.execute(uow -> {
             try (var ps = uow.connection().prepareStatement(

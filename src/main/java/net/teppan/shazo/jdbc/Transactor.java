@@ -95,9 +95,11 @@ public final class Transactor {
     private static final class BoundUnitOfWork implements UnitOfWork {
 
         private final Connection connection;
+        private final Connection guarded;
 
         BoundUnitOfWork(Connection connection) {
             this.connection = connection;
+            this.guarded = GuardedConnection.wrap(connection);
         }
 
         @Override
@@ -107,7 +109,9 @@ public final class Transactor {
 
         @Override
         public Connection connection() {
-            return connection;
+            // Hand application code a guarded view: it may run statements but must
+            // not commit/rollback/close the transaction the Transactor owns.
+            return guarded;
         }
     }
 }
